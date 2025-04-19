@@ -1,5 +1,5 @@
 import os
-import re
+import asyncio
 import argparse
 from utils import *
 from pathlib import Path
@@ -41,17 +41,25 @@ if not (os.path.exists(folder_path) and os.path.isdir(folder_path)):
     print("Error: No such directory")
     exit(1)
 
+""" async def get_yt_response():
+    files_details = await fetch_youtube_data("C# Programming for Beginners")
+    print(files_details)
+
+asyncio.run(get_yt_response()) """
 
 
-# Now use folder_path to walk through the folder and its subfolders
-markdown_files = get_markdown_files(folder_path)
-markdown_file = markdown_files[1]
+async def get_outdated_md_files():
+    outdated_md_files = await outdated_markdown_files(folder_path)
+    return outdated_md_files
 
-yt_urls = get_file_yt_urls(markdown_file)
 
+markdown_files = asyncio.run(get_outdated_md_files())
+print(markdown_files)
+
+""" # Log file updates
 if is_dry_run:
     # create dry-run log file
-    create_log_file(markdown_file, yt_urls, is_dry_run=True)
+    create_log_file(markdown_files, is_dry_run=True)
 elif not is_dry_run and logging_enabled:
     # Create update log file
-    create_log_file(markdown_file, yt_urls)
+    create_log_file(markdown_files) """
