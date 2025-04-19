@@ -2,3 +2,6 @@ __pycache__
 *.log
 .qodo
 backend/
+.env
+.venv
+*.json
