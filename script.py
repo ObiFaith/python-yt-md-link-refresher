@@ -1,4 +1,5 @@
 import os
+import json
 import asyncio
 import argparse
 from utils import *
@@ -41,20 +42,16 @@ if not (os.path.exists(folder_path) and os.path.isdir(folder_path)):
     print("Error: No such directory")
     exit(1)
 
-""" async def get_yt_response():
-    files_details = await fetch_youtube_data("C# Programming for Beginners")
-    print(files_details)
 
-asyncio.run(get_yt_response()) """
+async def main():
+    markdown_files = await get_markdown_files(folder_path)
+    outdated_md_data = await outdated_md_info(markdown_files)
 
-
-async def get_outdated_md_files():
-    outdated_md_files = await outdated_markdown_files(folder_path)
-    return outdated_md_files
+    with open("dump.json", "w", encoding="utf-8") as json_file:
+        json.dump(outdated_md_data, json_file)
 
 
-markdown_files = asyncio.run(get_outdated_md_files())
-print(markdown_files)
+asyncio.run(main())
 
 """ # Log file updates
 if is_dry_run:
