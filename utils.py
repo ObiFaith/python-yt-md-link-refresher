@@ -15,15 +15,37 @@ API_KEY = os.getenv("GOOGLE_API_KEY")
 YOUTUBE_API_URL = "https://www.googleapis.com/youtube/v3"
 
 
-def file_update_template(file_path: Path, yt_info: list[str]):
+async def file_update_template(file_path: Path, yt_info: list[str]):
     file_text = f"\nFILE: {file_path.as_posix()}\n"
     for yt_data in yt_info:
-        name, url = yt_data["name"], yt_data["url"]
-        file_text += f"Name: {name}\n[OLD] {url}\n[NEW] https://www.youtube.com/watch?v=xyz9876\n\n"
+        status, old_url, new_url, old_title, new_title = (
+            yt_data["status"],
+            yt_data["old_url"],
+            yt_data["new_url"],
+            yt_data["old_title"],
+            yt_data["new_title"],
+        )
+
+        initial_text = f"NAME: {old_title}\n[OLD] {old_url}"
+        text = f"\n[NEW] {new_url}\nNAME: {new_title}\STAT: {status}"
+
+        if new_url and new_title:
+            file_text += f"{initial_text}{text}\n\n"
+        else:
+            file_text += f"{initial_text}\n\n"
     return file_text
 
 
 async def get_file_yt_info(file_path: Path):
+    """
+    Extracts YouTube video/playlist links from a markdown file.
+
+    Args:
+        file_path (Path): Path to a markdown file.
+
+    Returns:
+        List[dict]: A list of dictionaries with 'name', 'type', and 'url' for each YouTube link.
+    """
     yt_info = []
     yt_url_pattern = re.compile(
         r"\[([^\]]+)\]\((https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtube\.com/playlist\?list=|youtu\.be/)[^)]+)\)"
@@ -44,7 +66,7 @@ async def get_file_yt_info(file_path: Path):
     return yt_info
 
 
-def create_log_file(markdown_files: list[Path], is_dry_run=False):
+async def create_log_file(markdown_files: list[Path], is_dry_run=False):
     current_date = date.today()
     log_file_path = "dry_run" if is_dry_run else "update_log"
     file_mode = "DRY RUN" if is_dry_run else "ACTUAL UPDATE"
@@ -60,8 +82,8 @@ def create_log_file(markdown_files: list[Path], is_dry_run=False):
 
     # log file update template for each md
     for markdown_file in markdown_files:
-        yt_info = get_file_yt_info(markdown_file)
-        file_text = file_update_template(markdown_file, yt_info)
+        yt_info = await get_file_yt_info(markdown_file)
+        file_text = await file_update_template(markdown_file, yt_info)
         with open(f"{log_file_path}_{current_date}.log", "a") as log_file:
             log_file.write(file_text)
 
@@ -79,17 +101,34 @@ async def get_markdown_files(folder_path: Path):
     return list(folder_path.rglob("*.md"))
 
 
-async def is_yt_url_outdated(yt_id: str, type="videos"):
+async def is_yt_url_outdated(video_ids: list[str], type="videos") -> dict[str, bool]:
+    if not video_ids:
+        return {}
+
+    joined_ids = ",".join(video_ids)
+
     async with httpx.AsyncClient() as client:
         response = await client.get(
-            f"{YOUTUBE_API_URL}/{type}?key={API_KEY}&id={yt_id}&part=snippet"
+            f"{YOUTUBE_API_URL}/{type}?key={API_KEY}&id={joined_ids}&part=snippet"
         )
 
-    current_year = datetime.now().year
     data = response.json()
-    published_year = int(data["items"][0]["snippet"]["publishedAt"][:4])
+    items = data.get("items", [])
+    current_year = datetime.now().year
 
-    return current_year - 3 >= published_year
+    # Map video_id => is_outdated
+    result = {}
+    for item in items:
+        vid_id = item.get("id")
+        published_year = int(item["snippet"]["publishedAt"][:4])
+        result[vid_id] = (current_year - 3) >= published_year
+
+    # For any IDs not returned in items (e.g., invalid IDs), mark as not outdated
+    for vid in video_ids:
+        if vid not in result:
+            result[vid] = False
+
+    return result
 
 
 async def get_new_yt_data(video_data):
@@ -108,40 +147,63 @@ async def get_new_yt_data(video_data):
 
 
 async def outdated_md_info(markdown_files: list[Path]):
-    outdated_md_data = []
+    outdated_md_data = {}
+
     for markdown_file in markdown_files:
         outdated_yt_info = []
         yt_info = await get_file_yt_info(markdown_file)
-        for yt_data in yt_info:
-            yt_url, yt_name, yt_type = yt_data["url"], yt_data["name"], yt_data["type"]
 
-            parsed_yt_url = urlparse(yt_url)
+        video_ids = []
+        id_to_data = {}
+
+        # Step 1: Collect all video IDs and map them back to yt_data
+        for yt_data in yt_info:
+            parsed_yt_url = urlparse(yt_data["url"])
             query_params = parse_qs(parsed_yt_url.query)
 
             if yt_data["type"] == "videos":
-                yt_url_id = query_params.get("v")[0]
-                is_vd_outdated = await is_yt_url_outdated(yt_url_id)
+                yt_url_id = query_params.get("v", [None])[0]
             else:
-                yt_url_id = query_params.get("list")[0]
-                is_vd_outdated = await is_yt_url_outdated(yt_url_id, yt_type)
+                yt_url_id = query_params.get("list", [None])[0]
 
-            if is_vd_outdated:
-                data = await fetch_youtube_data(yt_name, yt_type)
-                extra_data = (
-                    {"status": data}
-                    if isinstance(data, str)
-                    else await get_new_yt_data(data)
-                )
+            if yt_url_id:
+                video_ids.append(yt_url_id)
+                id_to_data[yt_url_id] = yt_data
 
-                outdated_yt_info.append(
-                    {
-                        "old_title": yt_data["name"],
-                        "type": yt_data["type"],
-                        "old_url": yt_data["url"],
-                        **extra_data,
-                    }
-                )
-        outdated_md_data.append({markdown_file.name: outdated_yt_info})
+        # Step 2: Batch check outdated status
+        outdated_status_map = await is_yt_url_outdated(video_ids)
+        print(f"outdated_status_map: {outdated_status_map}")
+
+        # Step 3: Process outdated ones
+        for vid_id, is_outdated in outdated_status_map.items():
+            if not is_outdated:
+                continue
+
+            yt_data = id_to_data[vid_id]
+            data = await fetch_youtube_data(yt_data["name"], yt_data["type"])
+
+            extra_data = (
+                {"status": data}
+                if isinstance(data, str)
+                else await get_new_yt_data(data)
+            )
+            print(f'extra_data: {extra_data}')
+
+            outdated_yt_info.append(
+                {
+                    "old_title": yt_data["name"],
+                    "type": yt_data["type"],
+                    "old_url": yt_data["url"],
+                    **extra_data,
+                }
+            )
+            print("outdated_yt_info")
+
+    parent_folder = "/".join(markdown_file.parts[:-1])
+
+    if outdated_yt_info:
+        outdated_md_data[parent_folder][markdown_file.name] = outdated_yt_info
+
     return outdated_md_data
 
 
@@ -160,7 +222,7 @@ async def is_relevant(title: str, keywords: list[str]):
 
     # Count how many keywords have at least a 30% fuzzy match score
     matched_keywords = sum(
-        1 for keyword in keywords if fuzz.partial_ratio(keyword, title_lower) >= 90
+        1 for keyword in keywords if fuzz.partial_ratio(keyword, title_lower) >= 70
     )
 
     threshold = max(1, int(len(keywords) * 0.7))
@@ -183,11 +245,11 @@ async def is_long_enough(duration_str: str, min_minutes=5):
     return duration.total_seconds() >= min_minutes * 60
 
 
-async def get_vid_duration(video_ids: list[str], type="videos"):
-    joined_vid_ids = ",".join(video_ids)
+async def get_item_info(item_ids: list[str], type="videos"):
+    joined_item_ids = ",".join(item_ids)
     async with httpx.AsyncClient() as client:
         response = await client.get(
-            f"{YOUTUBE_API_URL}/{type}?key={API_KEY}&id={joined_vid_ids}&part=snippet,contentDetails,statistics&order=viewCount"
+            f"{YOUTUBE_API_URL}/{type}?key={API_KEY}&id={joined_item_ids}&part=snippet,contentDetails,statistics&order=viewCount"
         )
     data = response.json()
     return data["items"]
@@ -205,7 +267,6 @@ async def fetch_youtube_data(title: str, type="videos"):
 
     data = response.json()
     items = data.get("items", [])
-    print(items)
 
     if not items:
         return f"No search result for '{title}'"
@@ -221,31 +282,35 @@ async def fetch_youtube_data(title: str, type="videos"):
     ]
 
     if not relevant_items:
+        print(f"No relevant search for '{title}'")
         return f"No relevant search for '{title}'"
 
-    for item in relevant_items:
-        if not isinstance(item.get("id"), dict) or "videoId" not in item["id"]:
-            print(f"Skipping item with unexpected ID format: {item['id']}")
+    # Step 3: Handle video or playlist based on type
+    if type == "videos":
+        video_ids = [item["id"]["videoId"] for item in relevant_items]
+        video_items = await get_item_info(video_ids)
 
-    # Step 3: Get video IDs
-    video_ids = [
-        item["id"]["videoId"]
-        for item in relevant_items
-        if isinstance(item.get("id"), dict) and "videoId" in item["id"]
-    ]
-    vids_info = await get_vid_duration(video_ids, type)
+        # Step 4: Filter by duration
+        check_long_video_items = await asyncio.gather(
+            *[
+                is_long_enough(item["contentDetails"]["duration"])
+                for item in video_items
+            ]
+        )
+        long_video_items = [
+            item for item, passed in zip(video_items, check_long_video_items) if passed
+        ]
 
-    # Step 4: Filter by duration
-    check_long_enough_items = await asyncio.gather(
-        *[is_long_enough(item["contentDetails"]["duration"]) for item in vids_info]
-    )
+        if not long_video_items:
+            print(f"'{title}' content not >= 5 mins")
+            return "No relevant video content that is >= 5 mins"
 
-    long_enough_items = [
-        item for item, passed in zip(vids_info, check_long_enough_items) if passed
-    ]
-    if not long_enough_items:
-        return "No relevant content that is >= 5 mins"
+        best_item = await get_best_item(long_video_items)
 
-    # Step 5: Find best match by title similarity
-    best_item = await get_best_item(long_enough_items)
+    elif type == "playlists":
+        playlist_ids = [item["id"]["playlistId"] for item in relevant_items]
+
+        playlist_items = await get_item_info(playlist_ids, "playlists")
+        best_item = await get_best_item(playlist_items)
+
     return best_item
