@@ -1,5 +1,6 @@
 import re
 import os
+import math
 import httpx
 import isodate
 import asyncio
@@ -18,22 +19,48 @@ YOUTUBE_API_URL = os.getenv("YOUTUBE_API_URL")
 
 async def file_update_template(file_path: Path, yt_info: list[str]):
     file_text = f"\nFILE: {file_path.as_posix()}\n"
+
     for yt_data in yt_info:
-        status, old_url, new_url, old_title, new_title = (
+        status, old_url, new_url, duration, old_title, new_title = (
             yt_data["status"],
             yt_data["old_url"],
             yt_data["new_url"],
-            yt_data["old_title"],
+            yt_data["duration"],
+            yt_data["new_title"],
             yt_data["new_title"],
         )
+
+        duration_in_word = await convert_duration(duration)
 
         file_text += f"NAME: {old_title}\n[OLD] {old_url}\n"
 
         if new_url and new_title:
-            file_text += f"[NEW] {new_url}\nNAME: {new_title}\n"
+            file_text += (
+                f"[NEW] {new_url}\nNAME: {new_title}\nTIME: {duration_in_word}\n"
+            )
 
         file_text += f"STAT: {status}\n\n"
     return file_text
+
+
+async def convert_duration(duration):
+    # Regex to extract minutes and seconds
+    match = re.match(r"PT(\d+)M(\d+)S", duration)
+    if match:
+        minutes = int(match.group(1))
+        seconds = int(match.group(2))
+
+        # Apply Math.ceil logic for seconds (round up if seconds > 0)
+        if seconds > 0:
+            minutes = math.ceil(minutes + 1)
+
+        # If minutes are greater than or equal to 60, convert to hours
+        if minutes >= 60:
+            hours = minutes / 60
+            return f"{hours:.2f} hours"
+        else:
+            return f"{minutes} minute(s)"
+    return "Invalid duration format"
 
 
 async def get_file_yt_info(file_path: Path):
@@ -102,6 +129,7 @@ async def get_markdown_files(folder_path: Path):
 
 
 async def get_new_yt_data(data, type: str):
+    print(f"get_new_yt_data: {data}")
     sub_url = "watch?v=" if type == "videos" else "playlist?list="
     sub_url += data["id"]
 
@@ -120,6 +148,11 @@ async def is_yt_url_outdated(yt_id: str, type="videos"):
         )
 
     data = response.json()
+
+    if data["error"]["code"] == 403:
+        print(data["error"]["message"])
+        exit(1)
+
     current_year = datetime.now().year
     published_year = int(data["items"][0]["snippet"]["publishedAt"][:4])
 
@@ -251,10 +284,16 @@ async def is_long_enough(duration_str: str, min_minutes=5):
 
 async def get_item_info(item_ids: list[str], type="videos"):
     joined_item_ids = ",".join(item_ids)
+    part_query = "snippet"
+
+    if type == "videos":
+        part_query += ",contentDetails,statistics&order=viewCount"
+
     async with httpx.AsyncClient() as client:
         response = await client.get(
-            f"{YOUTUBE_API_URL}/{type}?key={API_KEY}&id={joined_item_ids}&part=snippet,contentDetails,statistics&order=viewCount"
+            f"{YOUTUBE_API_URL}/{type}?key={API_KEY}&id={joined_item_ids}&part={part_query}"
         )
+
     data = response.json()
     return data["items"]
 
