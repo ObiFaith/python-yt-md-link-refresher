@@ -6,13 +6,14 @@ import asyncio
 from pathlib import Path
 from rapidfuzz import fuzz
 from dotenv import load_dotenv
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime
 from urllib.parse import urlparse, parse_qs
 
 load_dotenv()
 
+yt_outdated_cache = {}
 API_KEY = os.getenv("GOOGLE_API_KEY")
-YOUTUBE_API_URL = "https://www.googleapis.com/youtube/v3"
+YOUTUBE_API_URL = os.getenv("YOUTUBE_API_URL")
 
 
 async def file_update_template(file_path: Path, yt_info: list[str]):
@@ -100,53 +101,62 @@ async def get_markdown_files(folder_path: Path):
     return list(folder_path.rglob("*.md"))
 
 
-async def is_yt_url_outdated(video_ids: list[str], type="videos") -> dict[str, bool]:
-    if not video_ids:
-        return {}
-
-    joined_ids = ",".join(video_ids)
-
-    async with httpx.AsyncClient() as client:
-        response = await client.get(
-            f"{YOUTUBE_API_URL}/{type}?key={API_KEY}&id={joined_ids}&part=snippet"
-        )
-        data = response.json()
-
-    if data["error"]["code"] == 403:
-        print(f"Quota exceeded for YouTube API: {data['error']['message']}")
-        return
-
-    items = data.get("items", [])
-    threshold_date = datetime.now(timezone.utc) - timedelta(days=365 * 3)  # 3 years ago
-
-    # Map video_id => is_outdated
-    result = {}
-    for item in items:
-        vid_id = item.get("id")
-        published_at = item["snippet"]["publishedAt"]  # e.g. "2019-03-05T15:23:45Z"
-        published_date = datetime.strptime(published_at, "%Y-%m-%dT%H:%M:%SZ")
-        result[vid_id] = published_date <= threshold_date
-
-    # Handle missing videos (e.g., private or deleted ones)
-    for vid in video_ids:
-        if vid not in result:
-            result[vid] = False
-
-    return result
-
-
-async def get_new_yt_data(video_data):
-    yt_id = video_data["id"]
-    status = "Updated successfully!"
-    yt_title = video_data["snippet"]["title"]
-    yt_url = f"https://www.youtube.com/watch?{yt_id}"
-    duration = video_data["contentDetails"]["duration"]
+async def get_new_yt_data(data, type: str):
+    sub_url = "watch?v=" if type == "videos" else "playlist?list="
+    sub_url += data["id"]
 
     return {
-        "new_title": yt_title,
-        "new_url": yt_url,
-        "status": status,
-        "duration": duration,
+        "new_title": data["snippet"]["title"],
+        "new_url": f"https://www.youtube.com/{sub_url}",
+        "status": "Updated successfully!",
+        "duration": data["contentDetails"]["duration"],
+    }
+
+
+async def is_yt_url_outdated(yt_id: str, type="videos"):
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"{YOUTUBE_API_URL}/{type}?key={API_KEY}&id={yt_id}&part=snippet"
+        )
+
+    data = response.json()
+    current_year = datetime.now().year
+    published_year = int(data["items"][0]["snippet"]["publishedAt"][:4])
+
+    return current_year - 3 >= published_year
+
+
+async def check_and_update_yt(yt_data):
+    yt_url, yt_name, yt_type = yt_data["url"], yt_data["name"], yt_data["type"]
+
+    parsed_yt_url = urlparse(yt_url)
+    query_params = parse_qs(parsed_yt_url.query)
+
+    yt_url_id = (
+        query_params.get("v")[0] if yt_type == "videos" else query_params.get("list")[0]
+    )
+
+    if yt_url_id in yt_outdated_cache:
+        is_outdated = yt_outdated_cache[yt_url_id]
+    else:
+        is_outdated = await is_yt_url_outdated(yt_url_id, yt_type)
+        yt_outdated_cache[yt_url_id] = is_outdated
+
+    if not is_outdated:
+        return None
+
+    data = await fetch_youtube_data(yt_name, yt_type)
+    extra_data = (
+        {"status": data}
+        if isinstance(data, str)
+        else await get_new_yt_data(data, yt_type)
+    )
+
+    return {
+        "old_title": yt_name,
+        "type": yt_type,
+        "old_url": yt_url,
+        **extra_data,
     }
 
 
@@ -184,56 +194,12 @@ async def outdated_md_info(markdown_files: list[Path]) -> dict[str, dict[str, li
         outdated_yt_info: list[dict] = []
         yt_info = await get_file_yt_info(markdown_file)
 
-        # Collect all IDs and map back
-        video_ids: list[str] = []
-        id_to_data: dict[str, dict] = {}
+        # Gather all `check_and_update_yt()` tasks concurrently
+        update_tasks = [check_and_update_yt(yt_data) for yt_data in yt_info]
+        results = await asyncio.gather(*update_tasks)
 
-        for yt_data in yt_info:
-            parsed = urlparse(yt_data["url"])
-            params = parse_qs(parsed.query)
-
-            if yt_data["type"] == "videos":
-                vid_id = params.get("v", [None])[0]
-            else:
-                vid_id = params.get("list", [None])[0]
-
-            if vid_id:
-                video_ids.append(vid_id)
-                id_to_data[vid_id] = yt_data
-
-        # Skip if no IDs found
-        if not video_ids:
-            continue
-
-        # Batch check which IDs are outdated
-        outdated_status_map = await is_yt_url_outdated(video_ids)
-        if outdated_status_map is None:
-            return
-
-        # For each outdated ID, fetch replacement data
-        for vid_id, is_outdated in outdated_status_map.items():
-            if not is_outdated:
-                continue
-
-            yt_data = id_to_data[vid_id]
-            print(f"Outdated: {yt_data['name']} ({vid_id})")
-
-            fetched = await fetch_youtube_data(yt_data["name"], yt_data["type"])
-            print(f"Fetched data for {yt_data['name']}: {fetched}")
-
-            if isinstance(fetched, str):
-                extra = {"status": fetched}
-            else:
-                extra = await get_new_yt_data(fetched)
-
-            outdated_yt_info.append(
-                {
-                    "old_title": yt_data["name"],
-                    "type": yt_data["type"],
-                    "old_url": yt_data["url"],
-                    **extra,
-                }
-            )
+        # Filter out None results (non-outdated)
+        outdated_yt_info = [res for res in results if res]
 
         # Only add entry if there were outdated links
         if outdated_yt_info:
@@ -299,8 +265,9 @@ async def fetch_youtube_data(title: str, type="videos"):
 
     # Step 1: Get search results
     async with httpx.AsyncClient() as client:
+        title_normalized = title.lower().replace("c#", "c sharp").replace("c++", "cpp")
         response = await client.get(
-            f"{YOUTUBE_API_URL}/search?key={API_KEY}&part=snippet&q={title}&publishedAfter={published_after}&order=relevance&type={type}&maxResults=50"
+            f"{YOUTUBE_API_URL}/search?key={API_KEY}&part=snippet&q={title_normalized}&publishedAfter={published_after}&order=relevance&type={type}&maxResults=50"
         )
 
     data = response.json()
@@ -325,7 +292,9 @@ async def fetch_youtube_data(title: str, type="videos"):
 
     # Step 3: Handle video or playlist based on type
     if type == "videos":
-        video_ids = [item["id"]["videoId"] for item in relevant_items]
+        video_ids = [
+            item["id"]["videoId"] for item in relevant_items if "videoId" in item["id"]
+        ]
         video_items = await get_item_info(video_ids)
 
         # Step 4: Filter by duration
@@ -344,11 +313,15 @@ async def fetch_youtube_data(title: str, type="videos"):
             return "No relevant video content that is >= 5 mins"
 
         best_item = await get_best_item(long_video_items)
+        return best_item
 
     elif type == "playlists":
-        playlist_ids = [item["id"]["playlistId"] for item in relevant_items]
+        playlist_ids = [
+            item["id"]["playlistId"]
+            for item in relevant_items
+            if "playlistId" in item["id"]
+        ]
 
         playlist_items = await get_item_info(playlist_ids, "playlists")
         best_item = await get_best_item(playlist_items)
-
-    return best_item
+        return best_item
