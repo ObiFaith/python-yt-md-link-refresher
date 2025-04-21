@@ -6,7 +6,7 @@ import asyncio
 from pathlib import Path
 from rapidfuzz import fuzz
 from dotenv import load_dotenv
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlparse, parse_qs
 
 load_dotenv()
@@ -26,13 +26,12 @@ async def file_update_template(file_path: Path, yt_info: list[str]):
             yt_data["new_title"],
         )
 
-        initial_text = f"NAME: {old_title}\n[OLD] {old_url}"
-        text = f"\n[NEW] {new_url}\nNAME: {new_title}\STAT: {status}"
+        file_text += f"NAME: {old_title}\n[OLD] {old_url}\n"
 
         if new_url and new_title:
-            file_text += f"{initial_text}{text}\n\n"
-        else:
-            file_text += f"{initial_text}\n\n"
+            file_text += f"[NEW] {new_url}\nNAME: {new_title}\n"
+
+        file_text += f"STAT: {status}\n\n"
     return file_text
 
 
@@ -111,19 +110,24 @@ async def is_yt_url_outdated(video_ids: list[str], type="videos") -> dict[str, b
         response = await client.get(
             f"{YOUTUBE_API_URL}/{type}?key={API_KEY}&id={joined_ids}&part=snippet"
         )
+        data = response.json()
 
-    data = response.json()
+    if data["error"]["code"] == 403:
+        print(f"Quota exceeded for YouTube API: {data['error']['message']}")
+        return
+
     items = data.get("items", [])
-    current_year = datetime.now().year
+    threshold_date = datetime.now(timezone.utc) - timedelta(days=365 * 3)  # 3 years ago
 
     # Map video_id => is_outdated
     result = {}
     for item in items:
         vid_id = item.get("id")
-        published_year = int(item["snippet"]["publishedAt"][:4])
-        result[vid_id] = (current_year - 3) >= published_year
+        published_at = item["snippet"]["publishedAt"]  # e.g. "2019-03-05T15:23:45Z"
+        published_date = datetime.strptime(published_at, "%Y-%m-%dT%H:%M:%SZ")
+        result[vid_id] = published_date <= threshold_date
 
-    # For any IDs not returned in items (e.g., invalid IDs), mark as not outdated
+    # Handle missing videos (e.g., private or deleted ones)
     for vid in video_ids:
         if vid not in result:
             result[vid] = False
@@ -146,63 +150,97 @@ async def get_new_yt_data(video_data):
     }
 
 
-async def outdated_md_info(markdown_files: list[Path]):
-    outdated_md_data = {}
+async def outdated_md_info(markdown_files: list[Path]) -> dict[str, dict[str, list]]:
+    """
+    Scan markdown files for outdated YouTube videos/playlists (3+ years old)
+    and fetch updated replacements.
+
+    Args:
+        markdown_files (list[Path]): List of markdown file paths.
+
+    Returns:
+        dict: {
+            parent_folder: {
+                filename.md: [
+                    {
+                        "old_title": ...,
+                        "type": ...,
+                        "old_url": ...,
+                        "new_title": ...,
+                        "new_url": ...,
+                        "status": ...,
+                        "duration": ...
+                    },
+                    ...
+                ],
+                ...
+            },
+            ...
+        }
+    """
+    outdated_md_data: dict[str, dict[str, list]] = {}
 
     for markdown_file in markdown_files:
-        outdated_yt_info = []
+        outdated_yt_info: list[dict] = []
         yt_info = await get_file_yt_info(markdown_file)
 
-        video_ids = []
-        id_to_data = {}
+        # Collect all IDs and map back
+        video_ids: list[str] = []
+        id_to_data: dict[str, dict] = {}
 
-        # Step 1: Collect all video IDs and map them back to yt_data
         for yt_data in yt_info:
-            parsed_yt_url = urlparse(yt_data["url"])
-            query_params = parse_qs(parsed_yt_url.query)
+            parsed = urlparse(yt_data["url"])
+            params = parse_qs(parsed.query)
 
             if yt_data["type"] == "videos":
-                yt_url_id = query_params.get("v", [None])[0]
+                vid_id = params.get("v", [None])[0]
             else:
-                yt_url_id = query_params.get("list", [None])[0]
+                vid_id = params.get("list", [None])[0]
 
-            if yt_url_id:
-                video_ids.append(yt_url_id)
-                id_to_data[yt_url_id] = yt_data
+            if vid_id:
+                video_ids.append(vid_id)
+                id_to_data[vid_id] = yt_data
 
-        # Step 2: Batch check outdated status
+        # Skip if no IDs found
+        if not video_ids:
+            continue
+
+        # Batch check which IDs are outdated
         outdated_status_map = await is_yt_url_outdated(video_ids)
-        print(f"outdated_status_map: {outdated_status_map}")
+        if outdated_status_map is None:
+            return
 
-        # Step 3: Process outdated ones
+        # For each outdated ID, fetch replacement data
         for vid_id, is_outdated in outdated_status_map.items():
             if not is_outdated:
                 continue
 
             yt_data = id_to_data[vid_id]
-            data = await fetch_youtube_data(yt_data["name"], yt_data["type"])
+            print(f"Outdated: {yt_data['name']} ({vid_id})")
 
-            extra_data = (
-                {"status": data}
-                if isinstance(data, str)
-                else await get_new_yt_data(data)
-            )
-            print(f'extra_data: {extra_data}')
+            fetched = await fetch_youtube_data(yt_data["name"], yt_data["type"])
+            print(f"Fetched data for {yt_data['name']}: {fetched}")
+
+            if isinstance(fetched, str):
+                extra = {"status": fetched}
+            else:
+                extra = await get_new_yt_data(fetched)
 
             outdated_yt_info.append(
                 {
                     "old_title": yt_data["name"],
                     "type": yt_data["type"],
                     "old_url": yt_data["url"],
-                    **extra_data,
+                    **extra,
                 }
             )
-            print("outdated_yt_info")
 
-    parent_folder = "/".join(markdown_file.parts[:-1])
-
-    if outdated_yt_info:
-        outdated_md_data[parent_folder][markdown_file.name] = outdated_yt_info
+        # Only add entry if there were outdated links
+        if outdated_yt_info:
+            parent_folder = "/".join(markdown_file.parts[:-1]) or "/"
+            outdated_md_data.setdefault(parent_folder, {})[
+                markdown_file.name
+            ] = outdated_yt_info
 
     return outdated_md_data
 
