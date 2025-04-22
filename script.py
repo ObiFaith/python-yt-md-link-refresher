@@ -44,19 +44,15 @@ if not (os.path.exists(folder_path) and os.path.isdir(folder_path)):
 
 
 async def main():
-    markdown_files = await get_markdown_files(folder_path)
-    outdated_md_data = await outdated_md_info(markdown_files)
-
-    with open("data.json", "w", encoding="utf-8") as json_file:
-        json.dump(outdated_md_data, json_file)
-
-    # Create log file
     if is_dry_run:
         # create dry-run log file
-        await create_log_file(markdown_files, is_dry_run=True)
+        await create_log_file(is_dry_run=True)
     elif not is_dry_run and logging_enabled:
         # Create update log file
-        await create_log_file(markdown_files)
+        await create_log_file()
+
+    markdown_files = await get_markdown_files(folder_path)
+    await outdated_md_info(markdown_files)
 
 
 asyncio.run(main())
