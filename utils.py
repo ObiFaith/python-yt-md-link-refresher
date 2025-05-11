@@ -244,12 +244,14 @@ async def outdated_md_info(
 
         # Filter out None results (non-outdated)
         outdated_yt_info = [res for res in results if res]
-        file_text = await file_update_template(markdown_file, outdated_yt_info)
 
-        with open(
-            f"{log_file_path}_{current_date}.log", "a", encoding="utf-8"
-        ) as log_file:
-            log_file.write(file_text)
+        if outdated_yt_info:
+            file_text = await file_update_template(markdown_file, outdated_yt_info)
+
+            with open(
+                f"{log_file_path}_{current_date}.log", "a", encoding="utf-8"
+            ) as log_file:
+                log_file.write(file_text)
 
 
 async def extract_keywords(title: str):
