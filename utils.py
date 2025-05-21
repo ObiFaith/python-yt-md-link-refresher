@@ -1,5 +1,6 @@
 import re
 import os
+import json
 import math
 import httpx
 import isodate
@@ -12,9 +13,9 @@ from urllib.parse import urlparse, parse_qs
 
 load_dotenv()
 
-yt_outdated_cache = {}
-API_KEY = os.getenv("GOOGLE_API_KEY")
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 YOUTUBE_API_URL = os.getenv("YOUTUBE_API_URL")
+THREE_YEARS_AGO = datetime.now().year - 3
 
 
 async def file_update_template(file_path: Path, yt_info: list[str]):
@@ -76,22 +77,21 @@ async def get_file_yt_info(file_path: Path):
     """
     yt_info = []
     yt_url_pattern = re.compile(
-        r"\[([^\]]+)\]\((https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtube\.com/playlist\?list=|youtu\.be/)[^)]+)\)"
+        r"\((https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtube\.com/playlist\?list=|youtu\.be/)[^)]+)\)"
     )
 
     with open(file_path, "r", encoding="utf-8") as file:
         for line in file:
             match = yt_url_pattern.search(line)
             if match:
-                name = match.group(1).strip()
-                url = match.group(2).strip()
+                yt_url = match.group()[1:-1]
 
-                if "playlist?" in url:
+                if "playlist?" in yt_url:
                     type = "playlists"
                 else:
                     type = "videos"
 
-                yt_info.append({"name": name, "type": type, "url": url})
+                yt_info.append({"type": type, "url": yt_url})
 
     return yt_info
 
@@ -111,13 +111,10 @@ async def create_log_file(is_dry_run=False):
         )
 
 
-from pathlib import Path
-
-
 async def get_markdown_files(folder_path: Path):
     """
     Recursively finds all .md (Markdown) files in the given folder path,
-    excluding files in 'projects', 'project', 'assignment', 'assignments' directories.
+    excluding files in 'projects', 'project', 'assignment', 'assignments', upgrade-notice directories.
 
     Args:
         folder_path (Path): The root directory to search from.
@@ -127,7 +124,13 @@ async def get_markdown_files(folder_path: Path):
                      excluding those in the specified directories.
     """
     # List of folder names to exclude
-    exclude_folders = ["projects", "project", "assignment", "assignments"]
+    exclude_folders = [
+        "projects",
+        "project",
+        "assignment",
+        "assignments",
+        "upgrade-notice",
+    ]
 
     # Use rglob to find all .md files and filter out the ones in excluded directories
     return [
@@ -150,11 +153,11 @@ async def get_new_yt_data(data, type: str):
     }
 
 
-async def is_yt_url_outdated(yt_id: str, type="videos"):
+async def get_outdated_title(yt_id: str, type="videos"):
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(
-                f"{YOUTUBE_API_URL}/{type}?key={API_KEY}&id={yt_id}&part=snippet"
+                f"{YOUTUBE_API_URL}/{type}?key={YOUTUBE_API_KEY}&id={yt_id}&part=snippet"
             )
         except httpx.ConnectTimeout:
             print(f"Timeout while accessing {type} with id: {yt_id}")
@@ -165,14 +168,28 @@ async def is_yt_url_outdated(yt_id: str, type="videos"):
         print(data["error"]["message"])
         exit(1)
 
-    current_year = datetime.now().year
-    published_year = int(data["items"][0]["snippet"]["publishedAt"][:4])
+    yt_data_item = data["items"][0]["snippet"]
+    published_year = int(yt_data_item["publishedAt"][:4])
+    is_outdated = THREE_YEARS_AGO >= published_year
 
-    return current_year - 3 >= published_year
+    if is_outdated:
+        yt_title = yt_data_item["title"]
+        with open("outdated_content", "a", encoding="utf-8") as file:
+            json.dump(
+                {
+                    "id": yt_id,
+                    "title": yt_title,
+                    "tags": yt_data_item.get("tags", []),
+                    "description": yt_data_item["description"],
+                },
+                file,
+                indent=4,
+            )
+        return yt_title
 
 
 async def check_and_update_yt(yt_data):
-    yt_url, yt_name, yt_type = yt_data["url"], yt_data["name"], yt_data["type"]
+    yt_url, yt_type = yt_data["url"], yt_data["type"]
 
     parsed_yt_url = urlparse(yt_url)
     query_params = parse_qs(parsed_yt_url.query)
@@ -186,15 +203,7 @@ async def check_and_update_yt(yt_data):
             else query_params.get("list")[0]
         )
 
-    if yt_url_id in yt_outdated_cache:
-        is_outdated = yt_outdated_cache[yt_url_id]
-    else:
-        is_outdated = await is_yt_url_outdated(yt_url_id, yt_type)
-        yt_outdated_cache[yt_url_id] = is_outdated
-
-    if not is_outdated:
-        return None
-
+    yt_name = await get_outdated_title(yt_url_id, yt_type)
     data = await fetch_youtube_data(yt_name, yt_type)
 
     if not data:
@@ -297,7 +306,7 @@ async def get_video_info(video_ids: list[str]):
 
     async with httpx.AsyncClient() as client:
         response = await client.get(
-            f"{YOUTUBE_API_URL}/videos?key={API_KEY}&id={joined_video_ids}&part=snippet,contentDetails,statistics&order=viewCount"
+            f"{YOUTUBE_API_URL}/videos?key={YOUTUBE_API_KEY}&id={joined_video_ids}&part=snippet,contentDetails,statistics&order=viewCount"
         )
 
     data = response.json()
@@ -305,20 +314,17 @@ async def get_video_info(video_ids: list[str]):
 
 
 async def fetch_youtube_data(title: str, type="videos"):
-    min_upload_year = datetime.now().year - 3
-    published_after = f"{min_upload_year}-12-31T00:00:00Z"
+    published_after = f"{THREE_YEARS_AGO}-12-31T00:00:00Z"
 
     # Step 1: Get search results
     async with httpx.AsyncClient() as client:
         title_normalized = title.lower().replace("c#", "c sharp")
         response = await client.get(
-            f"{YOUTUBE_API_URL}/search?key={API_KEY}&part=snippet&q={title_normalized}&publishedAfter={published_after}&order=relevance&type={type}&maxResults=50"
+            f"{YOUTUBE_API_URL}/search?key={YOUTUBE_API_KEY}&part=snippet&q={title_normalized}&publishedAfter={published_after}&order=relevance&type={type}&maxResults=50"
         )
 
     data = response.json()
-    print(f"fetched data: {data}\n")
     items = data.get("items", [])
-    print(f"get items: {items}\n")
 
     if not items:
         return f"No search result for '{title}'"
@@ -361,7 +367,6 @@ async def fetch_youtube_data(title: str, type="videos"):
 
         best_video = await get_best_video(long_video_items)
         return best_video
-
-    elif type == "playlists":
+    """ elif type == "playlists":
         playlist_items = [item for item in relevant_items if "playlistId" in item["id"]]
-        return playlist_items[0]
+        return playlist_items[0] """
